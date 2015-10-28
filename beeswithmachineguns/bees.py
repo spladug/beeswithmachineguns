@@ -292,64 +292,103 @@ def _attack(params):
             print 'Bee %i lost sight of the target (connection timed out creating csv_filename).' % params['i']
             return None
 
-        if params['post_file']:
-            pem_file_path=_get_pem_path(params['key_name'])
-            os.system("scp -q -o 'StrictHostKeyChecking=no' -i %s %s %s@%s:/tmp/honeycomb" % (pem_file_path, params['post_file'], params['username'], params['instance_name']))
-            options += ' -T "%(mime_type)s; charset=UTF-8" -p /tmp/honeycomb' % params
-
-        if params['keep_alive']:
-            options += ' -k'
-
-        if params['cookies'] is not '':
-            options += ' -H \"Cookie: %s;sessionid=NotARealSessionID;\"' % params['cookies']
-        else:
-            options += ' -C \"sessionid=NotARealSessionID\"'
-
-        if params['basic_auth'] is not '':
-            options += ' -A %s' % params['basic_auth']
-
         params['options'] = options
-        benchmark_command = 'ab -r -n %(num_requests)s -c %(concurrent_requests)s %(options)s "%(url)s"' % params
+        params['flerg'] = max(1, (params['num_requests'] / params['concurrent_requests']))
+        benchmark_command = 'siege -v -i -b -r %(flerg)s -c %(concurrent_requests)s "%(url)s" | /home/ubuntu/siege-ab' % params
+        print "BENCHMARK:", benchmark_command
         stdin, stdout, stderr = client.exec_command(benchmark_command)
 
         response = {}
+        trd = response
 
-        ab_results = stdout.read()
-        ms_per_request_search = re.search('Time\ per\ request:\s+([0-9.]+)\ \[ms\]\ \(mean\)', ab_results)
+        ab_results = stderr.read()
+        output = ab_results
 
-        if not ms_per_request_search:
-            print 'Bee %i lost sight of the target (connection timed out running ab).' % params['i']
-            return None
+        def parse(expression, content, default=''):
+            s = re.search(expression, content)
+            return (s is not None and s.group(1)) or default
+        m = parse
 
-        requests_per_second_search = re.search('Requests\ per\ second:\s+([0-9.]+)\ \[#\/sec\]\ \(mean\)', ab_results)
-        failed_requests = re.search('Failed\ requests:\s+([0-9.]+)', ab_results)
+        try:
+            rt_secs = m('Response\ time:\s+([0-9.]+)\ secs', output)
+            print "rt_secs = %r" % rt_secs
+
+            if not rt_secs:
+                print "output = %r" % output
+                print "rt_secs = %r" % rt_secs
+                print 'Bee %i lost sight of the target (connection timed out running ab).' % params['i']
+                return None
+
+            trd['ms_per_request'] = \
+                float(float(rt_secs) * 1000.0)
+
+            trd['concurrency'] = \
+                float(m('Concurrency:\s+([0-9.]+)', output))
+
+            trd['requests_per_second'] = \
+                float(m('Transaction rate:\s+([0-9.]+)\ trans/sec', output))
+
+            trd['time_taken'] = \
+                float(m('Elapsed\ time:\s+([0-9.]+)\ secs', output))
+
+            # this bit requires siege_calc to be available on the worker bees
+            for pctile in (50, 75, 90, 95, 99):
+                trd['pctile_%s' % pctile] = \
+                    float(m('\s+%s\%%\s+([0-9]+)' % pctile, output, 0)) # e.g. '\s+50\%\s+([0-9]+)'
+
+            trd['complete_requests'] = \
+                float(m('Transactions:\s+([0-9]+)\ hits', output))
+
+            trd['failed_requests'] = \
+                float(m('Failed\ transactions:\s+([0-9]+)', output))
+
+            # note - may not be present - default to 0
+            # this isnt implemented yet either
+            trd['non_2xx_responses'] = 0.0
+
+            xferred_mb = m('Data\ transferred:\s+([0-9.]+) MB', output)
+            trd['total_transferred'] = \
+                float(float(xferred_mb) * 1024.0 * 1024.0)
+        except Exception as e:
+            import traceback
+            tb = sys.exc_info()[2]
+            lineno = None
+            for frame in traceback.extract_tb(tb):
+                if frame[0] == __file__:
+                    lineno = frame[1]
+                    break
+            print "line %i: %s" % (lineno, e)
+            raise
+
+        #requests_per_second_search = re.search('Requests\ per\ second:\s+([0-9.]+)\ \[#\/sec\]\ \(mean\)', ab_results)
+        #failed_requests = re.search('Failed\ requests:\s+([0-9.]+)', ab_results)
         response['failed_requests_connect'] = 0
         response['failed_requests_receive'] = 0
         response['failed_requests_length'] = 0
         response['failed_requests_exceptions'] = 0
-        if float(failed_requests.group(1)) > 0:
-            failed_requests_detail = re.search('(Connect: [0-9.]+, Receive: [0-9.]+, Length: [0-9.]+, Exceptions: [0-9.]+)', ab_results)
-            if failed_requests_detail:
-                response['failed_requests_connect'] = float(re.search('Connect:\s+([0-9.]+)', failed_requests_detail.group(0)).group(1))
-                response['failed_requests_receive'] = float(re.search('Receive:\s+([0-9.]+)', failed_requests_detail.group(0)).group(1))
-                response['failed_requests_length'] = float(re.search('Length:\s+([0-9.]+)', failed_requests_detail.group(0)).group(1))
-                response['failed_requests_exceptions'] = float(re.search('Exceptions:\s+([0-9.]+)', failed_requests_detail.group(0)).group(1))
+        #if float(failed_requests.group(1)) > 0:
+            #failed_requests_detail = re.search('(Connect: [0-9.]+, Receive: [0-9.]+, Length: [0-9.]+, Exceptions: [0-9.]+)', ab_results)
+            #if failed_requests_detail:
+                #response['failed_requests_connect'] = float(re.search('Connect:\s+([0-9.]+)', failed_requests_detail.group(0)).group(1))
+                #response['failed_requests_receive'] = float(re.search('Receive:\s+([0-9.]+)', failed_requests_detail.group(0)).group(1))
+                #response['failed_requests_length'] = float(re.search('Length:\s+([0-9.]+)', failed_requests_detail.group(0)).group(1))
+                #response['failed_requests_exceptions'] = float(re.search('Exceptions:\s+([0-9.]+)', failed_requests_detail.group(0)).group(1))
 
-        complete_requests_search = re.search('Complete\ requests:\s+([0-9]+)', ab_results)
+        #complete_requests_search = re.search('Complete\ requests:\s+([0-9]+)', ab_results)
 
-        response['ms_per_request'] = float(ms_per_request_search.group(1))
-        response['requests_per_second'] = float(requests_per_second_search.group(1))
-        response['failed_requests'] = float(failed_requests.group(1))
-        response['complete_requests'] = float(complete_requests_search.group(1))
+        #response['ms_per_request'] = float(ms_per_request_search.group(1))
+        #response['requests_per_second'] = float(requests_per_second_search.group(1))
+        #response['failed_requests'] = float(failed_requests.group(1))
+        #response['complete_requests'] = float(complete_requests_search.group(1))
 
-        stdin, stdout, stderr = client.exec_command('cat %(csv_filename)s' % params)
-        response['request_time_cdf'] = []
-        for row in csv.DictReader(stdout):
-            row["Time in ms"] = float(row["Time in ms"])
-            response['request_time_cdf'].append(row)
-        if not response['request_time_cdf']:
-            print 'Bee %i lost sight of the target (connection timed out reading csv).' % params['i']
-            return None
+        #stdin, stdout, stderr = client.exec_command('cat %(csv_filename)s' % params)
+        #response['request_time_cdf'] = []
+        #for row in csv.DictReader(stdout):
+            #row["Time in ms"] = float(row["Time in ms"])
+            #response['request_time_cdf'].append(row)
+        #if not response['request_time_cdf']:
+            #print 'Bee %i lost sight of the target (connection timed out reading csv).' % params['i']
+            #return None
 
         print 'Bee %i is out of ammo.' % params['i']
 
@@ -414,9 +453,9 @@ def _summarize_results(results, params, csv_filename):
         else:
             summarized_results['performance_accepted'] = False
 
-    summarized_results['request_time_cdf'] = _get_request_time_cdf(summarized_results['total_complete_requests'], summarized_results['complete_bees'])
-    if csv_filename:
-        _create_request_time_cdf_csv(results, summarized_results['complete_bees_params'], summarized_results['request_time_cdf'], csv_filename)
+    #summarized_results['request_time_cdf'] = _get_request_time_cdf(summarized_results['total_complete_requests'], summarized_results['complete_bees'])
+    #if csv_filename:
+        #_create_request_time_cdf_csv(results, summarized_results['complete_bees_params'], summarized_results['request_time_cdf'], csv_filename)
 
     return summarized_results
 
@@ -487,8 +526,8 @@ def _print_results(summarized_results):
     if 'tpr_bounds' in summarized_results and summarized_results['tpr_bounds'] is not None:
         print '     Time per request:\t\t%f [ms] (lower bounds)' % summarized_results['tpr_bounds']
 
-    print '     50%% responses faster than:\t%f [ms]' % summarized_results['request_time_cdf'][49]
-    print '     90%% responses faster than:\t%f [ms]' % summarized_results['request_time_cdf'][89]
+    #print '     50%% responses faster than:\t%f [ms]' % summarized_results['request_time_cdf'][49]
+    #print '     90%% responses faster than:\t%f [ms]' % summarized_results['request_time_cdf'][89]
 
     if 'performance_accepted' in summarized_results:
         print '     Performance check:\t\t%s' % summarized_results['performance_accepted']
@@ -578,42 +617,6 @@ def attack(url, n, c, **options):
             'rps': options.get('rps'),
             'basic_auth': options.get('basic_auth')
         })
-
-    print 'Stinging URL so it will be cached for the attack.'
-
-    request = urllib2.Request(url)
-    # Need to revisit to support all http verbs.
-    if post_file:
-        try:
-            with open(post_file, 'r') as content_file:
-                content = content_file.read()
-            request.add_data(content)
-        except IOError:
-            print 'bees: error: The post file you provided doesn\'t exist.'
-            return
-
-    if cookies is not '':
-        request.add_header('Cookie', cookies)
-
-    if basic_auth is not '':
-        authentication = base64.encodestring(basic_auth).replace('\n', '')
-        request.add_header('Authorization', 'Basic %s' % authentication)
-
-    # Ping url so it will be cached for testing
-    dict_headers = {}
-    if headers is not '':
-        dict_headers = headers = dict(j.split(':') for j in [i.strip() for i in headers.split(';') if i != ''])
-
-    for key, value in dict_headers.iteritems():
-        request.add_header(key, value)
-
-    if url.lower().startswith("https://") and hasattr(ssl, '_create_unverified_context'):
-        context = ssl._create_unverified_context()
-        response = urllib2.urlopen(request, context=context)
-    else:
-        response = urllib2.urlopen(request)
-
-    response.read()
 
     print 'Organizing the swarm.'
     # Spin up processes for connecting to EC2 instances
